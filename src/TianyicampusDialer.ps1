@@ -244,57 +244,86 @@ function Install-DialTask {
     $argument = '-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File "{0}" -Watch' -f $script:ScriptPath
     $user = Get-GuardCurrentUser
     $repeatMinutes = 30
+    $repeatFrom = (Get-Date).AddMinutes(1)
 
-    try {
-        $action    = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument $argument
-        $principal = New-ScheduledTaskPrincipal -UserId $user -LogonType Interactive -RunLevel Highest
+    $action    = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument $argument
+    $principal = New-ScheduledTaskPrincipal -UserId $user -LogonType Interactive -RunLevel Highest
+    $settings  = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
+                    -StartWhenAvailable -ExecutionTimeLimit ([TimeSpan]::Zero) `
+                    -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1) `
+                    -MultipleInstances IgnoreNew
+    $tLogon    = New-ScheduledTaskTrigger -AtLogOn -User $user
 
-        # 两个触发器：
-        #   1) 登录时启动 —— 开机即用；
-        #   2) 每 30 分钟重复一次 —— **自愈**：守护若已退出（崩溃 / 被杀 / 前台窗口被关掉），
-        #      下一次重复会把它拉回来；若它还在跑，新实例会撞上单实例锁并立刻退出（无害）。
-        #      配合下面的 -MultipleInstances IgnoreNew，调度器在上一实例仍存活时根本不会重复启动。
-        $tLogon = New-ScheduledTaskTrigger -AtLogOn -User $user
-        # 起点设为"1 分钟后"（而不是今天 0 点）：这样装完约 1 分钟守护就会自己起来，
-        # 之后每 30 分钟重复一次；不必等下一个整点/半小时刻度。
-        $repeatFrom = (Get-Date).AddMinutes(1)
+    # 重复触发器有两种写法，按顺序试 —— 因为**不同系统的 Task Scheduler 接受范围不同**：
+    #   A) 不写 Duration      → 视为"无限重复"（推荐，兼容性最好）
+    #   B) Duration=3650 天   → 备选
+    # 曾经用 [TimeSpan]::MaxValue，cmdlet 自己不报错，但注册时被拒：
+    #   "The task XML contains a value which is incorrectly formatted or out of range.
+    #    (12,42):Duration:P99999999DT23H59M59S"
+    # 那次静默回退成了"只有登录触发"的老任务 —— 所以这里**每一步都回读校验**，不再默默降级。
+    $variants = @(
+        [pscustomobject]@{ Name = '无 Duration（无限重复）'; Duration = $null },
+        [pscustomobject]@{ Name = 'Duration=3650 天';        Duration = (New-TimeSpan -Days 3650) }
+    )
+
+    $lastError = ''
+    foreach ($v in $variants) {
         try {
-            $tRepeat = New-ScheduledTaskTrigger -Once -At $repeatFrom `
-                -RepetitionInterval (New-TimeSpan -Minutes $repeatMinutes) `
-                -RepetitionDuration ([TimeSpan]::MaxValue)
+            if ($null -eq $v.Duration) {
+                $tRepeat = New-ScheduledTaskTrigger -Once -At $repeatFrom `
+                    -RepetitionInterval (New-TimeSpan -Minutes $repeatMinutes)
+            } else {
+                $tRepeat = New-ScheduledTaskTrigger -Once -At $repeatFrom `
+                    -RepetitionInterval (New-TimeSpan -Minutes $repeatMinutes) `
+                    -RepetitionDuration $v.Duration
+            }
+            Register-ScheduledTask -TaskName $dialTaskName -Action $action -Trigger @($tLogon, $tRepeat) `
+                -Principal $principal -Settings $settings -Force -ErrorAction Stop | Out-Null
         } catch {
-            # 个别系统不接受 MaxValue，退化成不带显式时长的写法（一般是"无限重复"）
-            $tRepeat = New-ScheduledTaskTrigger -Once -At $repeatFrom `
-                -RepetitionInterval (New-TimeSpan -Minutes $repeatMinutes)
+            $lastError = $_.Exception.Message
+            Write-GuardLog -Level Warn -Message ("注册尝试失败（{0}）: {1}" -f $v.Name, ($lastError -replace "`r?`n", ' '))
+            continue
         }
 
-        $settings  = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
-                        -StartWhenAvailable -ExecutionTimeLimit ([TimeSpan]::Zero) `
-                        -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1) `
-                        -MultipleInstances IgnoreNew
-
-        Register-ScheduledTask -TaskName $dialTaskName -Action $action -Trigger @($tLogon, $tRepeat) `
-            -Principal $principal -Settings $settings -Force -ErrorAction Stop | Out-Null
-
-        # 回读确认两个触发器都在（装机日志要能自证）
+        # 回读校验：必须是 2 个触发器，且其中之一带重复间隔
         $verify = $null
         try { $verify = Get-ScheduledTask -TaskName $dialTaskName -ErrorAction Stop } catch { }
         $triggerCount = if ($verify) { @($verify.Triggers).Count } else { 0 }
-        Write-GuardLog -Level Info -Message ("计划任务已注册: {0}（最高权限 / 登录触发 + 每 {1} 分钟自愈触发 / 免 UAC），回读触发器 {2} 个" -f $dialTaskName, $repeatMinutes, $triggerCount) -Data @{
-            action = $argument; user = $user; triggers = $triggerCount
+        $hasRepetition = $false
+        if ($verify) {
+            foreach ($t in @($verify.Triggers)) {
+                try { if ($t.Repetition -and $t.Repetition.Interval) { $hasRepetition = $true } } catch { }
+            }
         }
-        return 0
-    } catch {
-        Write-GuardLog -Level Warn -Message "Register-ScheduledTask 失败，回退到 schtasks: $($_.Exception.Message)"
-        $tr  = 'powershell.exe ' + $argument
-        $out = & schtasks.exe /create /tn $dialTaskName /sc onlogon /rl HIGHEST /f /tr $tr 2>&1
-        if ($LASTEXITCODE -eq 0) {
-            Write-GuardLog -Level Warn -Message "计划任务已注册(schtasks 回退模式): $dialTaskName —— 只有登录触发，**没有** 30 分钟自愈触发；如需自愈请重装并确认走的是 Register-ScheduledTask 路径"
+
+        if ($triggerCount -ge 2 -and $hasRepetition) {
+            Write-GuardLog -Level Info -Message ("计划任务已注册并校验通过: {0}（最高权限 / 登录触发 + 每 {1} 分钟自愈触发 / 免 UAC）触发器={2} 重复={3} 方式={4}" -f `
+                $dialTaskName, $repeatMinutes, $triggerCount, $hasRepetition, $v.Name) -Data @{
+                action = $argument; user = $user; triggers = $triggerCount; repetition = $v.Name
+            }
+            # 装完立刻把守护拉起来，不必等下一次触发
+            try {
+                Start-ScheduledTask -TaskName $dialTaskName -ErrorAction Stop
+                Write-GuardLog -Level Info -Message "已立即启动守护（Start-ScheduledTask $dialTaskName）"
+            } catch {
+                Write-GuardLog -Level Warn -Message ("已注册，但立即启动失败（下次触发仍会启动）: " + $_.Exception.Message)
+            }
             return 0
         }
-        Write-GuardLog -Level Error -Message "计划任务注册失败: $out" -Data @{ exit = $LASTEXITCODE }
-        return 2
+
+        Write-GuardLog -Level Warn -Message ("注册后回读校验不通过（触发器={0} 重复={1}，方式={2}），试下一种写法" -f $triggerCount, $hasRepetition, $v.Name)
     }
+
+    # 两种写法都不行才回退，并且**明确报警**：这种模式没有自愈
+    Write-GuardLog -Level Error -Message ("两种重复触发器写法都失败（最后错误: {0}），回退到 schtasks（只有登录触发、没有自愈）" -f ($lastError -replace "`r?`n", ' '))
+    $tr  = 'powershell.exe ' + $argument
+    $out = & schtasks.exe /create /tn $dialTaskName /sc onlogon /rl HIGHEST /f /tr $tr 2>&1
+    if ($LASTEXITCODE -eq 0) {
+        Write-GuardLog -Level Warn -Message "计划任务已注册(schtasks 回退模式): $dialTaskName —— 只有登录触发，**没有**自愈触发"
+        return 0
+    }
+    Write-GuardLog -Level Error -Message "计划任务注册失败: $out" -Data @{ exit = $LASTEXITCODE }
+    return 2
 }
 
 function Uninstall-DialTask {
