@@ -243,18 +243,45 @@ function Install-DialTask {
     }
     $argument = '-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File "{0}" -Watch' -f $script:ScriptPath
     $user = Get-GuardCurrentUser
+    $repeatMinutes = 30
 
     try {
         $action    = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument $argument
-        $trigger   = New-ScheduledTaskTrigger -AtLogOn -User $user
         $principal = New-ScheduledTaskPrincipal -UserId $user -LogonType Interactive -RunLevel Highest
+
+        # 两个触发器：
+        #   1) 登录时启动 —— 开机即用；
+        #   2) 每 30 分钟重复一次 —— **自愈**：守护若已退出（崩溃 / 被杀 / 前台窗口被关掉），
+        #      下一次重复会把它拉回来；若它还在跑，新实例会撞上单实例锁并立刻退出（无害）。
+        #      配合下面的 -MultipleInstances IgnoreNew，调度器在上一实例仍存活时根本不会重复启动。
+        $tLogon = New-ScheduledTaskTrigger -AtLogOn -User $user
+        # 起点设为"1 分钟后"（而不是今天 0 点）：这样装完约 1 分钟守护就会自己起来，
+        # 之后每 30 分钟重复一次；不必等下一个整点/半小时刻度。
+        $repeatFrom = (Get-Date).AddMinutes(1)
+        try {
+            $tRepeat = New-ScheduledTaskTrigger -Once -At $repeatFrom `
+                -RepetitionInterval (New-TimeSpan -Minutes $repeatMinutes) `
+                -RepetitionDuration ([TimeSpan]::MaxValue)
+        } catch {
+            # 个别系统不接受 MaxValue，退化成不带显式时长的写法（一般是"无限重复"）
+            $tRepeat = New-ScheduledTaskTrigger -Once -At $repeatFrom `
+                -RepetitionInterval (New-TimeSpan -Minutes $repeatMinutes)
+        }
+
         $settings  = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
                         -StartWhenAvailable -ExecutionTimeLimit ([TimeSpan]::Zero) `
-                        -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1)
-        Register-ScheduledTask -TaskName $dialTaskName -Action $action -Trigger $trigger `
+                        -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1) `
+                        -MultipleInstances IgnoreNew
+
+        Register-ScheduledTask -TaskName $dialTaskName -Action $action -Trigger @($tLogon, $tRepeat) `
             -Principal $principal -Settings $settings -Force -ErrorAction Stop | Out-Null
-        Write-GuardLog -Level Info -Message "计划任务已注册: $dialTaskName（最高权限 / 登录时触发 / 免 UAC）" -Data @{
-            action = $argument; user = $user
+
+        # 回读确认两个触发器都在（装机日志要能自证）
+        $verify = $null
+        try { $verify = Get-ScheduledTask -TaskName $dialTaskName -ErrorAction Stop } catch { }
+        $triggerCount = if ($verify) { @($verify.Triggers).Count } else { 0 }
+        Write-GuardLog -Level Info -Message ("计划任务已注册: {0}（最高权限 / 登录触发 + 每 {1} 分钟自愈触发 / 免 UAC），回读触发器 {2} 个" -f $dialTaskName, $repeatMinutes, $triggerCount) -Data @{
+            action = $argument; user = $user; triggers = $triggerCount
         }
         return 0
     } catch {
@@ -262,7 +289,7 @@ function Install-DialTask {
         $tr  = 'powershell.exe ' + $argument
         $out = & schtasks.exe /create /tn $dialTaskName /sc onlogon /rl HIGHEST /f /tr $tr 2>&1
         if ($LASTEXITCODE -eq 0) {
-            Write-GuardLog -Level Info -Message "计划任务已注册(schtasks): $dialTaskName"
+            Write-GuardLog -Level Warn -Message "计划任务已注册(schtasks 回退模式): $dialTaskName —— 只有登录触发，**没有** 30 分钟自愈触发；如需自愈请重装并确认走的是 Register-ScheduledTask 路径"
             return 0
         }
         Write-GuardLog -Level Error -Message "计划任务注册失败: $out" -Data @{ exit = $LASTEXITCODE }
@@ -302,24 +329,26 @@ function Get-DialTaskInfo {
         $i = $null
         try { $i = $t | Get-ScheduledTaskInfo -ErrorAction Stop } catch { }
         return [pscustomobject]@{
-            Known      = $true
-            Exists     = $true
-            State      = [string]$t.State
-            RunLevel   = [string]$t.Principal.RunLevel
-            LastRun    = $(if ($i) { [string]$i.LastRunTime } else { '' })
-            LastResult = $(if ($i) { [string]$i.LastTaskResult } else { '' })
-            Error      = ''
+            Known        = $true
+            Exists       = $true
+            State        = [string]$t.State
+            RunLevel     = [string]$t.Principal.RunLevel
+            TriggerCount = @($t.Triggers).Count
+            LastRun      = $(if ($i) { [string]$i.LastRunTime } else { '' })
+            LastResult   = $(if ($i) { [string]$i.LastTaskResult } else { '' })
+            Error        = ''
         }
     } catch {
         $denied = ($_.Exception.Message -match '拒绝|denied')
         return [pscustomobject]@{
-            Known      = $true
-            Exists     = $(if ($denied) { $null } else { $false })   # $null = 存在但读不到
-            State      = $(if ($denied) { '（存在，但读取需要提权）' } else { '' })
-            RunLevel   = ''
-            LastRun    = ''
-            LastResult = ''
-            Error      = $_.Exception.Message
+            Known        = $true
+            Exists       = $(if ($denied) { $null } else { $false })   # $null = 存在但读不到
+            State        = $(if ($denied) { '（存在，但读取需要提权）' } else { '' })
+            RunLevel     = ''
+            TriggerCount = 0
+            LastRun      = ''
+            LastResult   = ''
+            Error        = $_.Exception.Message
         }
     }
 }
@@ -361,6 +390,7 @@ function Show-DialStatus {
     Write-Host "自启任务   : $dialTaskName"
     if ($task.Exists -eq $true) {
         Write-Host "  状态     : $($task.State)   运行级别: $($task.RunLevel)"
+        Write-Host "  触发器   : $($task.TriggerCount) 个（应为 2：登录 + 每 30 分钟自愈）"
         Write-Host "  上次运行 : $($task.LastRun)   结果: $($task.LastResult)"
         if ($task.LastResult -and $task.LastResult -ne '0') {
             Write-Host "  ⚠ 上次结果非 0，说明上次自动运行没成功；看 $logDirectory\dialer-$(Get-Date -Format 'yyyyMMdd').log"
