@@ -4,7 +4,7 @@
 
 ---
 
-## 一、修掉的 5 个真 bug
+## 一、修掉的 6 个真 bug
 
 ### 1. `Get-ClientLoginState -Since` 声明成不可空类型
 
@@ -146,3 +146,46 @@ cmd.exe 按 **ANSI(GBK)** 解析批处理文件，`chcp 65001` 只影响控制�
 
 > 最后两个工具处理的是**官方客户端自己的文件**。它们的价值在于说明协议来源，
 > 请只在你自己已安装的客户端上、出于互操作性研究的目的使用。
+
+---
+
+## 五、已知行为（**不是** bug，别再查一遍）
+
+### 开机后会弹出一个校园门户网页
+
+**现象**：每次开机后不久，默认浏览器会自动打开校园网/天翼的门户登录页。
+
+**原因**（2026-10-24 实测确认，两个因素叠加）：
+
+1. **Windows 的联网探测（NCSI）**。`EnableActiveProbing = 1`，探测地址正是
+   `http://www.msftconnecttest.com/connecttest.txt` —— **和我们守护用的是同一个地址**。
+   开机后有一段约 **40 秒**的未认证窗口（守护要拉起 `ESurfingSvr` 并等它抓到服务端配置），
+   这段窗口里 NCSI 一探测就判定"强制门户"，于是拉起默认浏览器跳到门户页。
+2. **Edge 的会话恢复**。`HKCU\...\Run` 里有 Edge 自启项
+   （`msedge.exe --no-startup-window --win-session-start`），它可能把上次会话里的门户标签页也带出来，
+   于是看起来"弹了两次"。
+
+**决定：本项目不处理这个弹窗。** 理由是它纯属视觉噪音 —— 守护在开机后约 40 秒完成认证，
+网络随即正常，弹窗里的页面也就失效了。当前实现的承诺是"**让网络自动连上**"，不含界面行为。
+
+**如果以后要处理**，三条可行路线与代价（都已评估过，别从零开始查）：
+
+| | 做法 | 代价 |
+| --- | --- | --- |
+| A | 关掉 NCSI 主动探测（`HKLM\SYSTEM\CurrentControlSet\Services\NlaSvc\Parameters\Internet` 的 `EnableActiveProbing = 0`） | **彻底不弹**，且不影响本守护（我们自己发 HTTP 请求，不依赖 NCSI）。但这是系统级改动：Windows 不再显示"无 Internet"状态，个别依赖 NCSI 的应用联网判断会变 |
+| B | 守护里加一个窗口扫描器：每 1–2 秒枚举顶层窗口，标题命中门户特征（`175.12.104.*` / `124.232.225.*` / `189.cn` / `wlanuserip` / `天翼校园`）就把浏览器窗口最小化 | 不改系统；但页面仍会**短暂出现**（守护启动前的空档可能已经弹出）。历史版本 `Guard.Ui.psm1` 里有 `Find-GuardPopupMatches` / `Get-GuardClickPoint` 的雏形，但那个模块已随旧方案一起删除 |
+| C | 让认证在**开机阶段**就完成（开机触发任务），根本不存在门户态 | 从根上不弹；但凭据得从"当前用户 DPAPI"改成"**本机 DPAPI**"（本机任何进程可解密），安全性下降；且开机任务跑在 SYSTEM 会话里，反而更难做界面处理 |
+
+**复现/取证方法**：开机后立刻查这几处 ——
+
+```powershell
+# NCSI 探测开着吗
+Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Services\NlaSvc\Parameters\Internet' |
+    Select-Object EnableActiveProbing
+
+# 浏览器是什么时候被拉起来的（对比守护日志里的认证时刻）
+Get-Process msedge | Select-Object Id, StartTime
+
+# 守护那一轮的时间线
+Get-Content (Get-ChildItem logs\dialer-*.log | Sort-Object LastWriteTime -Descending | Select-Object -First 1).FullName -Tail 20
+```
