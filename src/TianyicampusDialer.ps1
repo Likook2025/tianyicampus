@@ -177,7 +177,20 @@ function Invoke-DialOnce {
         try {
             Start-Service -Name $config['ServiceName'] -ErrorAction Stop
             Write-GuardLog -Level Info -Message "已启动拨号服务 $($config['ServiceName'])（原状态 $svcState），它负责 keep.cgi 续命心跳"
-            Start-Sleep -Seconds 2
+            # ★ 刚启动的服务需要先做环境探测并加载加密算法模块，否则发 PortalConnect 会被拒。
+            #   实测（2026-10-24 19:51，重启后）：
+            #     19:51:26.791 portal connect start
+            #     19:51:26.791 m_pAutoZsm is NULL      ← 算法模块还没加载
+            #     19:51:26.791 authUrl is :            ← 认证地址为空
+            #     19:51:26.791 request 6 return err 12006,retry   ← 服务返回 12006 后放弃，不会自己重试
+            #     19:51:29.165 load AutoZSM begin/end  ← 2.4 秒后才加载完成
+            #   所以这里先给它一点加载时间；真正的保险是下面的重试（冷启动第一次赶不上，
+            #   第二次一定能赶上；热启动仍然一次成功）。
+            $settle = [int]$config['ServiceStartSettleSec']
+            if ($settle -gt 0) {
+                Write-GuardLog -Level Info -Message "等待 $settle 秒让服务完成环境探测与算法模块加载"
+                Start-Sleep -Seconds $settle
+            }
         } catch {
             Write-GuardLog -Level Error -Message "拨号服务 $($config['ServiceName']) 未运行且启动失败（需要管理员权限，请确认已用 -Install 注册提权计划任务）: $($_.Exception.Message)"
             return [pscustomobject]@{ Env = 'CAMPUS'; AuthState = $picture.AuthState; ExitCode = 2; Dialed = $false }
@@ -213,23 +226,45 @@ function Invoke-DialOnce {
     }
 
     $wire = Get-PortalWireFormat
-    $result = Invoke-GuardPortalLogin -User $cred.User -Password $cred.Password
-    Write-GuardLog -Level Info -Message ("终端拨号已发送（{0}/{1}）: Ok={2} 步骤={3}" -f $wire.Encoding, $wire.Framing, $result.Ok, $result.Steps.Count) -Data @{
-        user   = $cred.User
-        source = $cred.Source
-        error  = $result.Error
-        steps  = (($result.Steps | ForEach-Object { '{0}:{1}B' -f $_.OpCode, $_.Sent }) -join ' ')
+    $maxAttempts = [int]$config['DialAttempts']
+    if ($maxAttempts -lt 1) { $maxAttempts = 1 }
+    $retryGap    = [int]$config['DialRetryGapSec']
+    if ($retryGap -lt 1) { $retryGap = 1 }
+
+    # ★ 重试是关键：服务"冷启动"时（刚被我们拉起）算法模块还没加载完，
+    #   第一次 PortalConnect 会被它以 err 12006 拒掉，而它**不会自己重试**；
+    #   换一条新连接再来一次就好（每次尝试都必须自带 ClientStart —— 服务按连接维护状态机）。
+    $state = $picture.AuthState
+    for ($attempt = 1; $attempt -le $maxAttempts; $attempt++) {
+        $result = Invoke-GuardPortalLogin -User $cred.User -Password $cred.Password
+        Write-GuardLog -Level Info -Message ("终端拨号已发送（{0}/{1}）第 {2}/{3} 次: Ok={4} 步骤={5}" -f `
+            $wire.Encoding, $wire.Framing, $attempt, $maxAttempts, $result.Ok, $result.Steps.Count) -Data @{
+            user    = $cred.User
+            source  = $cred.Source
+            error   = $result.Error
+            attempt = $attempt
+            steps   = (($result.Steps | ForEach-Object { '{0}:{1}B' -f $_.OpCode, $_.Sent }) -join ' ')
+        }
+
+        if (-not $result.Ok) {
+            if ($attempt -lt $maxAttempts) { Start-Sleep -Seconds $retryGap; continue }
+            return [pscustomobject]@{ Env = 'CAMPUS'; AuthState = $state; ExitCode = 2; Dialed = $true }
+        }
+
+        $state = Wait-DialAuthenticated -TimeoutSec $config['OnceVerifyTimeoutSec']
+        if ($state -eq 'Authenticated') {
+            Write-GuardLog -Level Info -Message "拨号后认证校验: Authenticated（第 $attempt 次尝试成功）"
+            return [pscustomobject]@{ Env = 'CAMPUS'; AuthState = 'Authenticated'; ExitCode = 0; Dialed = $true }
+        }
+
+        if ($attempt -lt $maxAttempts) {
+            Write-GuardLog -Level Warn -Message ("第 {0}/{1} 次拨号未成功（校验={2}），{3} 秒后换一条连接重试" -f $attempt, $maxAttempts, $state, $retryGap)
+            Start-Sleep -Seconds $retryGap
+        }
     }
 
-    if (-not $result.Ok) {
-        return [pscustomobject]@{ Env = 'CAMPUS'; AuthState = $picture.AuthState; ExitCode = 2; Dialed = $true }
-    }
-
-    $state = Wait-DialAuthenticated -TimeoutSec $config['OnceVerifyTimeoutSec']
-    $level = if ($state -eq 'Authenticated') { 'Info' } else { 'Warn' }
-    Write-GuardLog -Level $level -Message "拨号后认证校验: $state"
-    $code = if ($state -eq 'Authenticated') { 0 } else { 2 }
-    return [pscustomobject]@{ Env = 'CAMPUS'; AuthState = $state; ExitCode = $code; Dialed = $true }
+    Write-GuardLog -Level Warn -Message ("已重试 {0} 次仍未认证成功（最后校验={1}）" -f $maxAttempts, $state)
+    return [pscustomobject]@{ Env = 'CAMPUS'; AuthState = $state; ExitCode = 2; Dialed = $true }
 }
 
 # ─────────────────────────────────────────────────────────────────────────────

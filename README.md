@@ -125,7 +125,10 @@ dial.secrets.json               DPAPI 凭据（不进版本库）
 | `CampusGateway` | `100.67.192.1` | 校园网默认网关（**换学校改这里**） |
 | `PollIntervalCampus` | 20 | 校园网未认证时的轮询间隔（秒） |
 | `PollIntervalIdle` | 120 | 已认证/家庭网络时的轮询间隔（秒） |
-| `OnceVerifyTimeoutSec` | 60 | 拨号后等待认证的秒数 |
+| `OnceVerifyTimeoutSec` | 60 | 单次拨号后等待认证的秒数 |
+| `ServiceStartSettleSec` | 8 | 服务是**我们启动的**时，先等这么久让它跑完环境探测、抓到服务端配置（`auth-url`）。抓不到就该次拨号失败，所以别调太小 |
+| `DialAttempts` | 3 | 一次判定内最多拨几次（冷启动第一次可能赶不上，第二次通常就成） |
+| `DialRetryGapSec` | 12 | 两次拨号之间的间隔秒数 |
 | `LogRetentionDays` / `LogLevel` | 14 / `Info` | 日志保留与级别 |
 | `DryRun` | `false` | 只判定与记录，不拨号 |
 | `TaskName` | `TianyicampusDialer` | 计划任务名 |

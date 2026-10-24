@@ -464,7 +464,12 @@ function Invoke-GuardPortalLogin {
     try {
         $sequence = @(
             [pscustomobject]@{ OpCode = $cmds.ClientStart;   Param = ''; WaitMs = 900 }
-            [pscustomobject]@{ OpCode = $cmds.CheckEnv;      Param = ''; WaitMs = 1500 }
+            # CheckEnv 之后必须给服务留时间：它要先做环境探测、再加载加密算法模块
+            # （日志里的 load AutoZSM / update algoid success，实测约 8~10 秒）。
+            # 在它未就绪时发 PortalConnect，会被以 err 12006 + 空 authUrl 拒掉，
+            # 而且服务**不会自己重试** —— 所以这里留足间隔，并由调用方做整体重试。
+            # 实测依据见 docs\dev-notes.md（2026-10-24 19:51 重启测试）。
+            [pscustomobject]@{ OpCode = $cmds.CheckEnv;      Param = ''; WaitMs = 3000 }
             [pscustomobject]@{ OpCode = $cmds.PortalConnect; Param = (New-PortalConnectParam -User $User -Password $Password); WaitMs = $ReadTimeoutMs }
         )
 

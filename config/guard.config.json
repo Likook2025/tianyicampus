@@ -19,6 +19,10 @@
   "PollIntervalIdle": 120,
   "OnceVerifyTimeoutSec": 60,
 
+  "ServiceStartSettleSec": 8,
+  "DialAttempts": 3,
+  "DialRetryGapSec": 12,
+
   "LogRetentionDays": 14,
   "LogLevel": "Info",
   "DryRun": false,
