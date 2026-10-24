@@ -1,0 +1,27 @@
+{
+  "ServiceName": "ESurfingSvr",
+  "ClientProcessName": "ESurfingClient",
+
+  "NeutralProbeUrl": "http://www.msftconnecttest.com/connecttest.txt",
+  "NeutralProbeExpectedContent": "Microsoft Connect Test",
+  "ProbeTimeoutSec": 5,
+
+  "PortalHosts": [ "124.232.225.*", "175.12.104.*", "*.189.cn" ],
+  "ContentMarkers": [ "detect.html", "wlanuserip", "189.cn", "auth.cgi" ],
+
+  "CampusCidr": "100.64.0.0/10",
+  "CampusGateway": "100.67.192.1",
+
+  "EnablePortalDetectProbe": false,
+  "PortalDetectUrl": "http://124.232.225.17:10001/detect.html",
+
+  "PollIntervalCampus": 20,
+  "PollIntervalIdle": 120,
+  "OnceVerifyTimeoutSec": 60,
+
+  "LogRetentionDays": 14,
+  "LogLevel": "Info",
+  "DryRun": false,
+
+  "TaskName": "TianyicampusDialer"
+}

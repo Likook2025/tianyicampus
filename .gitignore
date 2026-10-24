@@ -1,0 +1,23 @@
+# 运行期产物
+logs/
+runtime/
+*.log
+
+# 凭据：DPAPI 密文，且与「本机 + 本 Windows 账户」绑定，绝不能入库
+dial.secrets.json
+*.secrets.json
+
+# 本机生成的分析中间产物：
+# cwe-dec* 是把电信客户端加密 Web UI 解出来的明文，属于他人专有代码的转发，
+# 而且随时可用 tools\Recover-CweProtocol.py 重新生成 —— 不入库。
+cwe-dec*
+cwe-recovery-preview.txt
+
+# 旧方案留下的原始抓包与取证报告（含网卡 MAC、clientId、内网 IP、用户名）
+docs/evidence/
+
+# 抓包与临时文件
+*.etl
+*.pcapng
+*.txtdump.txt
+*.tmp

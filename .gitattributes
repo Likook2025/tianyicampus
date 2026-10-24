@@ -1,0 +1,22 @@
+# 换行符策略
+#
+# 批处理文件必须是 CRLF：cmd.exe 对 LF-only 的 .cmd 在某些 Windows 版本上
+# 会解析异常（症状和之前踩过的"窗口一闪就退"很像，极难排查）。
+# 其余文本文件交给 git 的 text=auto 处理即可，PowerShell 两种换行都能吃。
+
+* text=auto
+
+*.cmd text eol=crlf
+*.bat text eol=crlf
+
+# 明确按二进制处理，避免被"文本规范化"破坏
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.etl binary
+*.pcapng binary
+*.zxm binary
+*.dll binary
+*.exe binary
