@@ -49,7 +49,18 @@ for /f "delims=" %%s in ('git status --porcelain') do (
 )
 
 :identity
+rem Idempotent: if the commit author is no longer the placeholder identity, skip
+rem this step, so the script is safe to re-run - e.g. the identity was already
+rem fixed but the push failed last time.
 echo --- Step 1/3: commit author ---
+set "AUTHORMAIL="
+for /f "delims=" %%i in ('git log -1 --format=%%ae') do set "AUTHORMAIL=%%i"
+if /i not "!AUTHORMAIL!"=="noreply@example.com" (
+  echo     already set to your own identity - skipping:
+  git log -1 --format="      %%an <%%ae>"
+  echo.
+  goto :remote
+)
 for /f "delims=" %%i in ('git config user.name')  do set "CURNAME=%%i"
 for /f "delims=" %%i in ('git config user.email') do set "CURMAIL=%%i"
 echo     current: "!CURNAME!" ^<!CURMAIL!^>
@@ -67,9 +78,21 @@ echo     commit author is now:
 git log -1 --format="      %%an <%%ae>"
 echo.
 
+:remote
 echo --- Step 2/3: remote ---
+set "CURURL="
+for /f "delims=" %%u in ('git remote get-url origin 2^>nul') do set "CURURL=%%u"
 set "URL=%~1"
-if "!URL!"=="" set /p "URL=GitHub repository URL (https://github.com/USER/REPO.git): "
+if "!URL!"=="" (
+  if not "!CURURL!"=="" (
+    echo     origin is already set to:
+    echo       !CURURL!
+    set /p "URL=Press Enter to keep it, or paste another URL: "
+    if "!URL!"=="" set "URL=!CURURL!"
+  ) else (
+    set /p "URL=GitHub repository URL (https://github.com/USER/REPO.git): "
+  )
+)
 if "!URL!"=="" (
   echo [X] No URL given. Aborting.
   goto :end
@@ -84,9 +107,13 @@ git branch -M main
 git push -u origin main
 if errorlevel 1 (
   echo.
-  echo [X] Push failed. Common causes:
-  echo     - the GitHub repository is not empty (it must be created EMPTY)
-  echo     - not signed in yet (let Git Credential Manager open its window)
+  echo [X] Push failed. Copy EVERYTHING above this line and send it back.
+  echo     Common causes:
+  echo     - not signed in yet: let Git Credential Manager open its window and
+  echo       sign in; when it asks for a password, paste a personal access token
+  echo       ^(GitHub no longer accepts account passwords^)
+  echo     - TLS/proxy interception: if you see an SSL certificate error, the
+  echo       network or a security product is inspecting HTTPS
   echo     - wrong URL / no write permission
   goto :end
 )
